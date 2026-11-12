@@ -1722,12 +1722,37 @@ export async function activeDeliveries(data: DataLayer): Promise<ActiveDelivery[
  * the "out-of-band poller-correlated shape" #258 pinned decision 3 reserved for exactly this
  * migration. There is no bespoke `review-ready` message any more: one mechanism, no drift. The
  * fresh-review detection + Copilot nudge below stay here because review freshness is inherently
- * STATEFUL (keyed off `last_review_id`/`waiting_since`), which the stateless probe matchers cannot
+ * STATEFUL (keyed off `last_review_id` — see {@link selectFreshReview}), which the stateless probe matchers cannot
  * subsume — the poller owns the forward-progress guarantee, the gate owns the bounded wait. */
 // The poller's PR current-head reader — the SAME branch-ref-preferring reader the converge-gate and
 // progress-check bind (#786/#799), so the poller's stale-review detection sees the exact head those
 // steps do. Fails OPEN to `null` (unreadable head → not stale, per `isReviewStale`).
 const readCurrentHead = makeDefaultReadHead({ fetchPrHead, fetchBranchHead });
+
+/** The ONE review-freshness predicate (issue #920): the newest SUBMITTED review the loop has not
+ * consumed yet (`id > last_review_id`; a reset/null cursor — a fresh run — treats every review as
+ * unconsumed). Callers must still apply the current-head guard (`isReviewStale`, #799) to the result.
+ *
+ * Freshness is deliberately NOT bounded by `waiting_since`. That stamp is written by
+ * `pr.progress-check` at the END of a round, so a review of the current head that landed during the
+ * round (the agent pushed, a fast reviewer reviewed while the round was wrapping up) or before the
+ * loop even started was excluded forever: the head never moves again, no later review arrives, and the
+ * wait could only end by the timeout escalation — paging a human about a review already on the PR.
+ * `last_review_id` already prevents double consumption and the stale-head guard already rejects a
+ * review of a superseded head, which together cover what the time fence was guarding.
+ *
+ * Exported so every review-wait reconcile (e.g. the timeout-arm reconcile, #791) shares this predicate
+ * instead of re-deriving one. */
+export function selectFreshReview<R extends { id: number; submitted_at?: string | null }>(
+  reviews: readonly R[],
+  lastReviewId: number | null | undefined,
+): R | undefined {
+  const lastId = lastReviewId ?? 0;
+  return reviews
+    .filter((rv) => rv.id > lastId && !!rv.submitted_at)
+    .sort((a, b) => a.id - b.id)
+    .pop();
+}
 
 export async function pollReviews(data: DataLayer, engine: EngineClient, token: string) {
   const waiting = await prs(data).find({ status: "waiting_review" });
@@ -1742,14 +1767,16 @@ export async function pollReviews(data: DataLayer, engine: EngineClient, token: 
       // review round. `null` → handled-but-not-finalized (cancel failed): skip this pass, stay pollable.
       const retired = await retireTerminalReviewWait(data, engine, pr, token);
       if (retired !== false) continue;
+      // #920: a row still OWNED by the merge loop it is being handed back from (stranded between
+      // `handoffWaitingMergeToConvergence`'s staging write and `submitPr`) has no convergence loop
+      // parked on `wait-review`. Correlating would flip it to `converging` under the retiring merge
+      // owner — outside the handoff's re-drive allowlist — so leave it for the recovery pass. This
+      // ownership check replaces the `submitted_at >= waiting_since` time fence that used to shield
+      // the handoff (and only shielded it from PRE-handoff reviews).
+      if (pr.retire_pending_key != null && String(pr.retire_pending_key) === String(pr.process_key)) continue;
       const reviews = await fetchPrReviews(repo, number, token);
       if (reviews === null) return; // no usable transport (no gh, no token) → idle
-      const fresh = reviews
-        .filter((rv) =>
-          rv.id > lastId && rv.submitted_at && (!pr.waiting_since || rv.submitted_at >= pr.waiting_since)
-        )
-        .sort((a, b) => a.id - b.id)
-        .pop();
+      const fresh = selectFreshReview(reviews, lastId);
       if (!fresh) {
         // No fresh review yet. Copilot won't re-review a round with no new commit and dismisses
         // re-requests, so actively (re-)solicit the next review — throttled to one attempt per
@@ -2258,9 +2285,9 @@ export async function handoffWaitingMergeToConvergence(
   const prKey = pr.pr_key;
   const mergeKey = pr.process_key != null ? String(pr.process_key) : null;
   try {
-    // `waiting_since` bounds the review the fresh loop collects: only a review submitted at or after
-    // the handoff counts, so a pre-merge review (submitted before this flip) can never satisfy the new
-    // run's wait.
+    // While this row is staged `waiting_review` but still OWNED by the merge instance
+    // (`retire_pending_key === process_key`), `pollReviews` does not correlate it (#920) — no
+    // convergence loop is parked on `wait-review` until `submitPr` publishes the successor below.
     // FENCE the staging write on the captured owner (PR #944 review): if a cancel/resubmit replaced the
     // owner while this pass awaited GitHub, the replacement owns the row (possibly parked on a stage such
     // as `waiting_deps`) — re-staging it to `waiting_review` would strand it outside its stage's scan.
