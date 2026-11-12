@@ -1163,12 +1163,34 @@ export async function activeDeliveries(data: DataLayer): Promise<ActiveDelivery[
  * the "out-of-band poller-correlated shape" #258 pinned decision 3 reserved for exactly this
  * migration. There is no bespoke `review-ready` message any more: one mechanism, no drift. The
  * fresh-review detection + Copilot nudge below stay here because review freshness is inherently
- * STATEFUL (keyed off `last_review_id`/`waiting_since`), which the stateless probe matchers cannot
+ * STATEFUL (keyed off `last_review_id` — see {@link selectFreshReview}), which the stateless probe matchers cannot
  * subsume — the poller owns the forward-progress guarantee, the gate owns the bounded wait. */
 // The poller's PR current-head reader — the SAME branch-ref-preferring reader the converge-gate and
 // progress-check bind (#786/#799), so the poller's stale-review detection sees the exact head those
 // steps do. Fails OPEN to `null` (unreadable head → not stale, per `isReviewStale`).
 const readCurrentHead = makeDefaultReadHead({ fetchPrHead, fetchBranchHead });
+
+/** The ONE review-freshness predicate (issue #920): the newest SUBMITTED review the loop has not
+ * consumed yet (`id > last_review_id`; a reset/null cursor — a fresh run — treats every review as
+ * unconsumed). Callers must still apply the current-head guard (`isReviewStale`, #799) to the result.
+ *
+ * Freshness is deliberately NOT bounded by `waiting_since`. That stamp is written by
+ * `pr.progress-check` at the END of a round, so a review of the current head that landed during the
+ * round or before the loop started was excluded forever and the wait could only end by the timeout
+ * escalation. `last_review_id` prevents double consumption and the stale-head guard rejects a review
+ * of a superseded head, which together cover what the time fence was guarding.
+ *
+ * Exported so every review-wait reconcile (e.g. the timeout-arm reconcile, #791) shares it. */
+export function selectFreshReview<R extends { id: number; submitted_at?: string | null }>(
+  reviews: readonly R[],
+  lastReviewId: number | null | undefined,
+): R | undefined {
+  const lastId = lastReviewId ?? 0;
+  return reviews
+    .filter((rv) => rv.id > lastId && !!rv.submitted_at)
+    .sort((a, b) => a.id - b.id)
+    .pop();
+}
 
 export async function pollReviews(data: DataLayer, engine: EngineClient, token: string) {
   const waiting = await prs(data).find({ status: "waiting_review" });
@@ -1178,12 +1200,7 @@ export async function pollReviews(data: DataLayer, engine: EngineClient, token: 
     try {
       const reviews = await fetchPrReviews(repo, number, token);
       if (reviews === null) return; // no usable transport (no gh, no token) → idle
-      const fresh = reviews
-        .filter((rv) =>
-          rv.id > lastId && rv.submitted_at && (!pr.waiting_since || rv.submitted_at >= pr.waiting_since)
-        )
-        .sort((a, b) => a.id - b.id)
-        .pop();
+      const fresh = selectFreshReview(reviews, lastId);
       if (!fresh) {
         // No fresh review yet. Copilot won't re-review a round with no new commit and dismisses
         // re-requests, so actively (re-)solicit the next review — throttled to one attempt per
